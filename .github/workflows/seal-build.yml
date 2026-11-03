@@ -1,0 +1,92 @@
+name: seal-build
+
+# Upstream spring-cloud-commons 2.1.x has no GitHub Actions CI (only .circleci/config.yml).
+# This workflow translates the CircleCI "Running build" job: ./mvnw (Maven 3.5.0 wrapper)
+# on JDK 8, install with tests, checkstyle + spring-javaformat validation left ON.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      _JAVA_OPTIONS: "-Xms1024m -Xmx2048m"
+      TERM: dumb
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Drop repo.spring.io profile from .mvn/maven.config
+        # maven.config activates -P spring (repo.spring.io, now auth-only); everything resolves from Central.
+        run: ": > .mvn/maven.config"
+
+      - name: Build and test (full suite)
+        if: ${{ inputs.test-filter == '' }}
+        run: >
+          ./mvnw --batch-mode -e -nsu
+          -Dmaven.test.redirectTestOutputToFile=true
+          -Dmaven.javadoc.skip=true -Dgpg.skip=true
+          clean install -pl spring-cloud-context -am
+
+      - name: Build and test (filtered)
+        if: ${{ inputs.test-filter != '' }}
+        run: >
+          ./mvnw --batch-mode -e -nsu
+          -Dmaven.test.redirectTestOutputToFile=true
+          -Dmaven.javadoc.skip=true -Dgpg.skip=true
+          -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false
+          clean install -pl spring-cloud-context -am
+
+      - name: Stage release jar
+        run: |
+          mkdir -p seal-out
+          cp spring-cloud-context/target/spring-cloud-context-2.1.6.RELEASE.jar seal-out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spring-cloud-context-jar
+          path: seal-out/spring-cloud-context-2.1.6.RELEASE.jar
+          if-no-files-found: error
+
+      - name: Test result and skip report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          tot = fail = err = skip = 0
+          for f in sorted(glob.glob('*/target/surefire-reports/TEST-*.xml')):
+              mod = f.split('/')[0]
+              r = ET.parse(f).getroot()
+              t, fa, e, s = (int(r.get(k, 0)) for k in ('tests', 'failures', 'errors', 'skipped'))
+              tot += t; fail += fa; err += e; skip += s
+              print(f"SUITE {mod} {r.get('name')}: tests={t} failures={fa} errors={e} skipped={s}")
+              for tc in r.findall('testcase'):
+                  sk = tc.find('skipped')
+                  if sk is None:
+                      continue
+                  cls = tc.get('classname'); name = tc.get('name')
+                  msg = (sk.get('message') or '').strip()
+                  if not msg:
+                      src = os.path.join(mod, 'src/test/java', cls.replace('.', '/') + '.java')
+                      if os.path.exists(src):
+                          lines = open(src, encoding='utf-8').read().splitlines()
+                          for i, line in enumerate(lines):
+                              if re.search(r'\bvoid\s+' + re.escape(name) + r'\s*\(', line):
+                                  for j in range(i - 1, max(i - 8, -1), -1):
+                                      if '@Ignore' in lines[j] or '@Disabled' in lines[j]:
+                                          msg = f"{src}:{j+1}: {lines[j].strip()}"
+                                          break
+                                  break
+                  print(f"SKIPPED {cls}.{name} -- reason: {msg}")
+          print(f"TOTAL tests={tot} failures={fail} errors={err} skipped={skip} passed={tot-fail-err-skip}")
+          EOF
